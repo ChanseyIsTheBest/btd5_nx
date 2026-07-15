@@ -14,12 +14,22 @@ sdmc:/switch/btd5
 ├── libnative.so                   <- from your APK: lib/arm64-v8a/
 └── Assets/                        <- from your APK: the whole assets/ folder
 ```
+Optionally, drop a `cursor.png` (64x64, transparency supported) in the same folder to replace the on-screen cursor with your own.
 
 ## Controls
  
-In handheld — touch screen support.
-In handheld and docked — `+` brings up the cursor, `-` hides the cursor, `A` taps.
- The left stick moves the cursor and `B` is Back.
+| Input | Action |
+| --- | --- |
+| `+` | Toggle the on-screen cursor |
+| `-` | Toggle gyro pointing (tilt/turn the controller to aim) |
+| Left stick | Move the cursor |
+| `L` / `R` | Recenter the cursor to the middle of the screen (helps gyro aiming) |
+| `A` / `ZR` / `ZL` | Tap / confirm (ZL and ZR let you play one-handed) |
+| D-pad up / down | Adjust sensitivity of whatever is driving the cursor |
+
+A USB mouse works in both handheld and docked: move to control the cursor, left-click to tap, and use the scroll wheel to change 
+sensitivity.
+Your stick, mouse and gyro sensitivities are remembered in `pointer.cfg` automatically after in0game adjustment.
 
 ## Requirements (to build)
  
@@ -32,4 +42,4 @@ pacman -S switch-mesa switch-libdrm_nouveau switch-sdl2 switch-freetype switch-l
 
 ## Credits
  
-The loader/shim infrastructure (`so_util`, `libc_shim`, `imports`, `error`) derives from the SoLoader lineage — TheOfficialFloW's Vita/Switch loader tradition, by way of the open-source `colorsheep_nx` Switch port, all MIT-licensed
+The loader/shim infrastructure (`so_util`, `libc_shim`, `imports`, `error`) derives from the SoLoader lineage — TheOfficialFloW's Vita/Switch loader tradition, by way of the open-source `colorsheep_nx` Switch port, all MIT-licensed.
