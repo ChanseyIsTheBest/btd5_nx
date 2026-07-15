@@ -11,9 +11,9 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
 TARGET		:=	$(notdir $(CURDIR))
-APP_TITLE	:=	Bloons Tower Defence 5
+APP_TITLE	:=	Bloons TD 5
 APP_AUTHOR	:=	ChanseyIsTheBest
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.0.1
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
@@ -154,6 +154,10 @@ $(OFILES_SRC)	: $(HFILES_BIN)
 	@$(bin2o)
 
 -include $(DEPENDS)
+
+#---------------------------------------------------------------------------------------
+endif
+#---------------------------------------------------------------------------------------
 
 #---------------------------------------------------------------------------------------
 endif
