@@ -29,7 +29,7 @@ Optionally, drop a `cursor.png` (64x64, transparency supported) in the same fold
 
 A USB mouse works in both handheld and docked: move to control the cursor, left-click to tap, and use the scroll wheel to change 
 sensitivity.
-Your stick, mouse and gyro sensitivities are remembered in `pointer.cfg` automatically after in0game adjustment.
+Your stick, mouse and gyro sensitivities are remembered in `pointer.cfg` automatically after in-game adjustment.
 
 ## Requirements (to build)
  
