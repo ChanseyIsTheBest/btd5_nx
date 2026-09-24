@@ -15,7 +15,7 @@
  *      deadlock: if the faulting thread already held newlib's stdio lock
  *      (the engine logs from inside nativeTick), re-entering it hangs the
  *      handler. So by default we DO NOT use debugPrintf here. Instead we
- *      append to a SEPARATE file (sdmc:/switch/btd5/btd5_crash.log) with a
+ *      append to a SEPARATE file (btd5_crash.log in the game folder) with a
  *      raw fd (open/write/close -- no stdio lock, no heap) opened inside the
  *      handler, and mirror every line to svcOutputDebugString for a debugger.
  *      Residual caveat: the fs devoptab still takes its own mutex; if the
@@ -30,7 +30,7 @@
  * Optional -D overrides (Makefile):
  *   CRASH_LOG_PRINTF=fn     force a custom logger instead of the fd sink
  *                           (e.g. =debugPrintf -- accepts the deadlock risk)
- *   CRASH_SINK_FILE="path"  crash-log path (default sdmc:/switch/btd5/btd5_crash.log)
+ *   (the crash log is <game folder>/btd5_crash.log -- see nx_paths.h)
  *   CRASH_STACK_BYTES=0x200 stack bytes to hex-dump around SP
  *   CRASH_BT_DEPTH=16       max backtrace frames
  *   CRASH_REBREAK=1         re-raise via svcBreak after dumping (default 1)
@@ -46,6 +46,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "config.h"
+#include "nx_paths.h"
 #include "so_util.h"   /* so_loaded_list(), so_module */
 
 #ifndef CRASH_STACK_BYTES
@@ -56,9 +58,6 @@
 #endif
 #ifndef CRASH_REBREAK
 #define CRASH_REBREAK 1
-#endif
-#ifndef CRASH_SINK_FILE
-#define CRASH_SINK_FILE "sdmc:/switch/btd5/btd5_crash.log"
 #endif
 
 /* ---- output shim ---------------------------------------------------------- *
@@ -80,10 +79,13 @@ static s64    g_crash_off = 0;
  * truncated to empty, for the handler to append to via fsFileWrite. */
 void crash_log_open(void) {
     FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
-    if (!fs) return;
-    fsFsCreateFile(fs, "/switch/btd5/btd5_crash.log", 0, 0);   /* no-op if exists */
-    if (R_SUCCEEDED(fsFsOpenFile(fs, "/switch/btd5/btd5_crash.log",
-                                 FsOpenMode_Write, &g_crash_file))) {
+    char path[600];
+    /* The game folder (nx_paths.c), resolved HERE on the main thread: the
+     * handler itself may run where newlib is unusable. */
+    if (!fs || !nx_data_fs_path(CRASH_FILE, path, sizeof path)) return;
+    nx_data_dir_ensure();
+    fsFsCreateFile(fs, path, 0, 0);   /* no-op if exists */
+    if (R_SUCCEEDED(fsFsOpenFile(fs, path, FsOpenMode_Write, &g_crash_file))) {
         fsFileSetSize(&g_crash_file, 0);    /* truncate to empty */
         g_crash_ok = 1; g_crash_off = 0;
     }

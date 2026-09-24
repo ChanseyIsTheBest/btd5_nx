@@ -35,11 +35,16 @@
 #include "util.h"
 #include "error.h"
 #include "platform.h"
+#include "nx_pointer.h"
 #include "imports.h"
+#include "nx_net.h"
+#include "nx_keyboard.h"
+#include "nx_paths.h"
+#include "nx_savetool.h"
+#include "libc_shim.h"
 
 int screen_width  = 0;
 int screen_height = 0;
-Config config;
 
 static so_module game_mod;
 
@@ -141,14 +146,33 @@ static void pump_input(void)
   for (int i = 0; i < n; i++) {
     float x = ev[i].x, y = ev[i].y; int id = ev[i].id;
     switch (ev[i].phase) {
-      case PTR_DOWN: if (e_nativeTouchStarted) e_nativeTouchStarted(fake_env,thiz,x,y,id); break;
+      case PTR_DOWN: nxk_note_tap();
+                     if (e_nativeTouchStarted) e_nativeTouchStarted(fake_env,thiz,x,y,id); break;
       case PTR_MOVE: if (e_nativeTouchHeld)    e_nativeTouchHeld(fake_env,thiz,x,y,id,1);  break;
       case PTR_UP:   if (e_nativeTouchEnded)   e_nativeTouchEnded(fake_env,thiz,x,y,id);   break;
     }
   }
-  /* B / + -> Android Back key (there is no nativeBackPressed callback). */
-  if (e_nativeInputKeyDown && back_edge_pressed())  e_nativeInputKeyDown(fake_env,thiz,AKEYCODE_BACK,0);
-  if (e_nativeInputKeyUp   && back_edge_released()) e_nativeInputKeyUp(fake_env,thiz,AKEYCODE_BACK,0);
+}
+
+/* ---- software keyboard: the Java side of CDroidKeyboard -------------------- *
+ * The engine asked for a keyboard during this frame (ShowKeyboard(true) via
+ * ninjakiwi.c). Run the Switch keyboard now, between frames, then answer as
+ * Android's MainActivity would: the field's whole text, then "hidden". See
+ * nx_keyboard.h for why this cannot happen inside the engine's own call. */
+static void pump_keyboard(void)
+{
+  if (!nxk_pending()) return;
+  typedef void (*fn_text)(JNIEnv env, void *thiz, void *jstr);
+  typedef void (*fn_void)(JNIEnv env, void *thiz);
+  fn_text changed = (fn_text)jni_registered("nativeInputTextChanged");
+  fn_void hidden  = (fn_void)jni_registered("nativeKeyboardHidden");
+  char text[2048];
+  const int ok = nxk_run(text, sizeof text);
+  if (ok && changed) changed(fake_env, thiz, jni_make_string(text));
+  if (hidden) hidden(fake_env, thiz);
+  if (!changed || !hidden)
+    nx_net_logf("[kbd] engine keyboard callbacks missing (text=%p hidden=%p)\n",
+                (void *)changed, (void *)hidden);
 }
 
 /* ---------------------------------------------------------------------------
@@ -173,12 +197,17 @@ static unsigned long long g_frame_count = 0;
 int main(int argc, char *argv[])
 {
   (void)argc; (void)argv;
+  nx_paths_init();                    /* the game folder: where the .nro runs from */
+  nx_data_dir_ensure();               /* so debugPrintf/crash log can be written  */
+  shim_tmp_cleanup();                 /* temp files a previous run left in <folder>/tmp */
+  nx_savetool_apply();                /* save.txt -> Profile.save, before the engine loads it */
   stage("0 enter main");
-  mkdir("sdmc:/switch", 0777);
-  mkdir(DATA_DIR, 0777);              /* so debugPrintf/crash log can be written */
+  debugPrintf("game folder: %s (from the %s)\n", nx_data_dir(), nx_data_dir_source());
   /* Surface the previous run's crash dump in the main log for convenience. */
   {
-    FILE *pf = fopen(DATA_DIR "/btd5_crash.log", "rb");
+    char crash_path[600];
+    FILE *pf = nx_data_file(CRASH_FILE, crash_path, sizeof crash_path)
+                 ? fopen(crash_path, "rb") : NULL;
     if (pf) {
       char cb[256]; size_t cn;
       debugPrintf("=== PREVIOUS RUN btd5_crash.log ===\n");
@@ -192,12 +221,22 @@ int main(int argc, char *argv[])
   cpu_boost(1);                       /* run at full clocks */
   tls_setup_guard();                  /* TLS slot the .so's TLS access expects */
   pin_current_thread();               /* SINGLE_CORE: main thread on the same core */
-  read_config(CONFIG_NAME);
+  /* Fixed 1080p in every mode: the Switch compositor scales the 1080p buffer
+   * down to the 720p handheld panel, so there is no separate handheld path and
+   * no live GL surface resize on dock/undock. */
+  screen_width  = 1920;
+  screen_height = 1080;
   stage("1 config read");
+  /* Sockets + nifm, sized for the engine's concurrent blocking calls, before
+   * any engine code runs (curl/OpenSSL/Asio all start from nativeLoad on). */
+  nx_net_init();
+  stage("1b network up");
 
   /* 1. map + relocate + resolve the game library against our shim table */
   stage("2 so_load: heap alloc + open libnative.so");
-  if (so_load(&game_mod, SO_NAME, heap_so_base(), heap_so_limit()) < 0)
+  char so_path[600];
+  if (!nx_data_file(SO_NAME, so_path, sizeof so_path) ||
+      so_load(&game_mod, so_path, heap_so_base(), heap_so_limit()) < 0)
     fatal_error("Couldn't load " SO_NAME ".\nPut it (and the Assets/ folder) "
                 "from YOUR OWN copy of Bloons TD 5 next to this .nro.");
   stage("3 so_relocate");
@@ -262,7 +301,6 @@ int main(int argc, char *argv[])
     if (first_tick) stage("12a before padUpdate");
     padUpdate_all();
     if (first_tick) stage("12b after padUpdate");
-    if (should_quit()) break;
     if (handle_dock_change(&screen_width, &screen_height)) {
       stage("13 dock nativeResize");
       e_nativeResize(fake_env, thiz, screen_width, screen_height);
@@ -277,6 +315,7 @@ int main(int argc, char *argv[])
     }
     if (first_tick) stage("14 first nativeTick");
     e_nativeTick(fake_env, thiz);    /* engine updates, renders, and presents */
+    pump_keyboard();                 /* a text field asked for the keyboard */
     if (first_tick) { stage("15 running"); first_tick = 0; }
 
     /* Heartbeat: the loop is otherwise silent after stage 15, so a log ending at
@@ -301,7 +340,11 @@ int main(int argc, char *argv[])
   if (e_nativePause) e_nativePause(fake_env, thiz);
   if (e_nativeSurfaceDestroyed) e_nativeSurfaceDestroyed(fake_env, thiz);
   if (e_nativeUnload) e_nativeUnload(fake_env, thiz);
+  nxp_save_settings();             /* commit any pending sensitivity change */
   opensles_shutdown();
+#if !DEBUG_LOG
+  nx_net_exit();          /* with DEBUG_LOG, userAppExit closes nxlink first */
+#endif
   debugLogFlush();                 /* push the buffered log to the SD card */
   egl_exit_context();
   cpu_boost(0);

@@ -18,10 +18,7 @@ void egl_exit_context(void);
 
 /* ---- per-frame input ----------------------------------------------------- */
 void padUpdate_all(void);       /* padUpdate + sample touch/cursor once/frame */
-int  should_quit(void);         /* true when the user asks to exit            */
 int  handle_dock_change(int *w, int *h);  /* 1 if dock state (res) changed    */
-int  back_edge_pressed(void);   /* B / + edge -> Android Back down            */
-int  back_edge_released(void);
 
 /* Unified pointer events for this frame. Handheld = touchscreen fingers;
  * docked = a single stick-driven cursor with A as the "finger". */
@@ -56,10 +53,8 @@ void glDrawElements_fake(GLenum mode, GLsizei count, GLenum type, const void *id
 
 EGLBoolean eglQuerySurface_fake(EGLDisplay d, EGLSurface s, EGLint attr, EGLint *val);
 
-/* On-screen cursor: '+' shows it, '-' hides it, 'A' taps. Available in both
- * handheld and docked; in handheld the touchscreen stays live alongside it. */
-int  cursor_is_visible(void);
-void cursor_get_pos(float *x, float *y);
-void cursor_draw(void);        /* called from eglSwapBuffers_fake */
+/* Cursor overlay, drawn from eglSwapBuffers_fake. Implemented by the reusable
+ * nx_pointer module -- see nx_pointer.h for the full control scheme. */
+void cursor_draw(void);
 
 #endif

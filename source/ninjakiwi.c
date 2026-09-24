@@ -17,6 +17,7 @@
  * MIT license -- see LICENSE.
  */
 
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -25,6 +26,9 @@
 #include "music.h"
 #include "util.h"
 #include "config.h"
+#include "nx_net.h"
+#include "nx_keyboard.h"
+#include "nx_paths.h"
 
 /* Native result callbacks resolved in main.c (push async answers up). */
 extern void nk_report_licensed(void);   /* -> nativeLicenseResult(0,0)          */
@@ -86,7 +90,7 @@ jvalue nk_upcall(const char *cls, const char *name, const char *sig,
       M("getCacheStoragePath")    || M("getStorageDirectory") ||
       M("getExternalFilesDir")    || M("getFilesDir") ||
       M("getSaveDirectory")       || M("getDataDirectory")) {
-    r.l = jni_make_string(DATA_DIR);
+    r.l = jni_make_string(nx_data_dir());
     return r;
   }
 
@@ -95,11 +99,14 @@ jvalue nk_upcall(const char *cls, const char *name, const char *sig,
    * unique id + language to finish profile/analytics init), so answer them. */
   if (M("getUniqueID") || M("getUniqueDeviceID") || M("getDeviceID") ||
       M("getAndroidID") || M("getInstallID")) {
-    r.l = jni_make_string("switch-btd5-local"); return r;
+    /* Feeds Ninja Kiwi's UDID / device_id: it must differ per console, or
+     * every Switch presents the same identity online (nx_net.c). */
+    r.l = jni_make_string(nx_net_device_id()); return r;
   }
   if (M("getLanguageCode") || M("getDeviceLanguage") || M("getLanguage")) {
-    r.l = jni_make_string((config.language[0] && strcmp(config.language,"auto"))
-                          ? config.language : "en");
+    /* Seed the engine's initial locale from the Switch system language. The
+     * in-game language menu overrides this afterwards. */
+    r.l = jni_make_string(nx_system_language());
     return r;
   }
   if (M("getCountryCode") || M("getCountry")) { r.l = jni_make_string("US"); return r; }
@@ -109,27 +116,33 @@ jvalue nk_upcall(const char *cls, const char *name, const char *sig,
     r.j = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     return r;
   }
-  /* Connectivity / status: we're a standalone offline build. Report "offline"
-   * consistently (0) so the engine takes its offline path rather than waiting
-   * on a network that will never arrive. */
+  /* Connectivity: the real state from nifm (always 0 with online=0 in
+   * config.txt). The engine mostly learns this by trying, through the socket
+   * layer in nx_socket.c; these answer any explicit query consistently. */
   if (M("isOnline") || M("isNetworkAvailable") || M("hasNetworkConnection") ||
       M("isConnected") || M("isWifiConnected") || M("hasInternet")) {
-    r.i = 0; r.z = 0; return r;
+    r.i = nx_net_online(); r.z = (jboolean)r.i; return r;
   }
+
+  /* ---- Software keyboard (CDroidKeyboard -> MainActivity) ---------------
+   * Matched by name on any class: the engine calls these on its cached
+   * activity jobject, which can be reported as java/lang/Object. The Switch
+   * keyboard itself opens between frames -- see nx_keyboard.h. */
+  if (M("ShowKeyboard"))             { nxk_request(argv[0].i != 0); return r; }   /* (Z)V */
+  if (M("SetKeyboardInputType"))     { nxk_set_input_type(argv[0].i); return r; } /* (I)V */
+  if (M("SetKeyboardMaxCharacters")) { nxk_set_max_chars(argv[0].i); return r; }  /* (I)V */
 
   /* ---- MainActivity: device / display / environment --------------------- */
   if (CLS("com/ninjakiwi/MainActivity")) {
-    if (M("getDeviceLanguage")) {
-      r.l = jni_make_string((config.language[0] && strcmp(config.language,"auto"))
-                            ? config.language : "en"); return r; }
+    if (M("getDeviceLanguage")) { r.l = jni_make_string(nx_system_language()); return r; }
     if (M("getDeviceModel"))  { r.l = jni_make_string("Nintendo Switch"); return r; }
     if (M("getCountryCode"))  { r.l = jni_make_string("US");              return r; }
     if (M("getBundleName"))   { r.l = jni_make_string("com.ninjakiwi.bloonstd5"); return r; }
     if (M("getUniqueDeviceID") || M("getDeviceID")) {
-      r.l = jni_make_string("switch-btd5-local"); return r; }
+      r.l = jni_make_string(nx_net_device_id()); return r; }
     if (M("getStorageDirectory") || M("getExternalFilesDir") || M("getSaveDirectory")) {
-      r.l = jni_make_string(DATA_DIR); return r; }
-    if (M("isNetworkAvailable") || M("hasNetworkConnection")) { r.z = 0; return r; }
+      r.l = jni_make_string(nx_data_dir()); return r; }
+    if (M("isNetworkAvailable") || M("hasNetworkConnection")) { r.z = (jboolean)nx_net_online(); return r; }
     if (M("useImmersiveMode")) { r.z = 1; return r; }         /* (FF)Z */
     if (M("hasClipboardTextEntry")) { r.i = 0; return r; }    /* ()I    */
     if (M("openURL")) { r.i = 0; return r; }                  /* no browser */
@@ -185,7 +198,7 @@ jvalue nk_upcall(const char *cls, const char *name, const char *sig,
     if (MHAS("PlayerId") || MHAS("PlayerID") || MHAS("AccountId")) {
       r.l = jni_make_string("");  return r; }                /* non-NULL empty id */
     if (MHAS("PlayerName") || MHAS("DisplayName") || MHAS("Nickname")) {
-      r.l = jni_make_string("Player"); return r; }
+      r.l = jni_make_string(nx_net_player_name()); return r; }
     if (MHAS("Token") || MHAS("AuthCode")) { r.l = jni_make_string(""); return r; }
     if (MHAS("Friends") || MHAS("Invites") || MHAS("Players")) {
       r.l = jni_make_object(); return r; }                   /* empty, non-NULL */
@@ -312,5 +325,5 @@ jvalue nk_upcall(const char *cls, const char *name, const char *sig,
  * (wired in main.c). Full wiring is a bring-up item -- see README. */
 void nk_request_keyboard(jobject prompt) {
   (void)prompt;
-  debugPrintf("showKeyboard requested (swkbd wiring: see README bring-up)\n");
+  nxk_request(1);                  /* same path as ShowKeyboard(true) */
 }

@@ -32,6 +32,8 @@
 #include <switch.h>
 
 #include "config.h"
+#include "nx_net.h"
+#include "nx_paths.h"
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
@@ -43,6 +45,8 @@
 // the asset base it uses. Real pseudo-paths (/proc, /dev, /sys) are left alone.
 static const char *remap_data_path(const char *path, char *buf, size_t bufsz);
 static int path_would_crash_newlib(const char *path);
+static int mode_writes(const char *m);
+static int open_writes(int f);
 
 /* ---------------------------------------------------------------------------
  * newlib file-table lock
@@ -64,6 +68,11 @@ static int path_would_crash_newlib(const char *path);
 static RMutex g_file_lock;
 #define FILE_LOCK()   rmutexLock(&g_file_lock)
 #define FILE_UNLOCK() rmutexUnlock(&g_file_lock)
+
+/* libnx socket()/accept() allocate newlib handles too (__alloc_handle), so the
+ * network layer takes the same lock around them (nx_socket.c). */
+void shim_fdtable_lock(void)   { FILE_LOCK(); }
+void shim_fdtable_unlock(void) { FILE_UNLOCK(); }
 
 /* Locked wrappers around the newlib entry points that resolve a path to a
  * device (FindDevice) or mutate the fd table. Serialising these removes the
@@ -107,7 +116,12 @@ static inline int fclose_L(FILE *f) {
  * Reads/writes on an ALREADY-open handle are left unlocked: they only touch
  * their own slot, and newlib locks per-stream. */
 int close_fake(int fd) {
-  FILE_LOCK(); int r = close(fd); FILE_UNLOCK(); return r;
+  /* Emulated fds (eventfd, epoll, pipes, /dev/urandom) are not newlib
+   * handles; sockets must leave every epoll set and the tracking table
+   * BEFORE their number can be reused (see nx_socket.c). */
+  int r;
+  if (nxs_close_hook(fd, &r)) return r;
+  FILE_LOCK(); r = close(fd); FILE_UNLOCK(); return r;
 }
 FILE *fdopen_fake(int fd, const char *mode) {
   FILE_LOCK(); FILE *f = fdopen(fd, mode); FILE_UNLOCK(); return f;
@@ -115,17 +129,12 @@ FILE *fdopen_fake(int fd, const char *mode) {
 FILE *freopen_fake(const char *path, const char *mode, FILE *f) {
   char rbuf[600];
   if (path) {
-    path = remap_data_path(path, rbuf, sizeof rbuf);
+    path = shim_game_path(path, rbuf, sizeof rbuf, mode_writes(mode));
     if (path_would_crash_newlib(path)) return NULL;
   }
   FILE_LOCK(); FILE *r = freopen(path, mode, f); FILE_UNLOCK(); return r;
 }
-FILE *tmpfile_fake(void) {
-  FILE_LOCK(); FILE *f = tmpfile(); FILE_UNLOCK(); return f;
-}
-int mkstemp_fake(char *tmpl) {
-  FILE_LOCK(); int fd = mkstemp(tmpl); FILE_UNLOCK(); return fd;
-}
+/* tmpfile_fake / mkstemp_fake: see the game-folder gate further down. */
 
 
 
@@ -374,7 +383,9 @@ static int convert_open_flags(int flags) {
 
 int open_fake(const char *path, int flags, ...) {
   char rbuf[600];
-  path = remap_data_path(path, rbuf, sizeof rbuf);
+  if (path && (!strcmp(path, "/dev/urandom") || !strcmp(path, "/dev/random")))
+    return nxf_open_urandom(flags);
+  path = shim_game_path(path, rbuf, sizeof rbuf, open_writes(flags));
   if (path_would_crash_newlib(path)) {
     debugPrintf("open(%s) -> refused (unsafe device-root path)\n", path ? path : "(null)");
     return -1;
@@ -394,7 +405,7 @@ int open_fake(const char *path, int flags, ...) {
 int openat_fake(int dirfd, const char *path, int flags, ...) {
   (void)dirfd; // assume AT_FDCWD or absolute paths
   char rbuf[600];
-  path = remap_data_path(path, rbuf, sizeof rbuf);
+  path = shim_game_path(path, rbuf, sizeof rbuf, open_writes(flags));
   if (path_would_crash_newlib(path)) return -1;
   int mode = 0666;
   if (flags & LINUX_O_CREAT) {
@@ -409,9 +420,9 @@ int openat_fake(int dirfd, const char *path, int flags, ...) {
 int unlinkat_fake(int dirfd, const char *path, int flags) {
   (void)dirfd; (void)flags;
   char rbuf[600];
-  path = remap_data_path(path, rbuf, sizeof rbuf);
+  path = shim_game_path(path, rbuf, sizeof rbuf, 1);
   if (path_would_crash_newlib(path)) return -1;
-  return unlink(path);
+  FILE_LOCK(); int r = unlink(path); FILE_UNLOCK(); return r;
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +473,7 @@ static void convert_stat(const struct stat *in, struct bionic_stat *out) {
 
 int stat_fake(const char *path, struct bionic_stat *st) {
   char rbuf[600];
-  path = remap_data_path(path, rbuf, sizeof rbuf);
+  path = shim_game_path(path, rbuf, sizeof rbuf, 0);
   if (path_would_crash_newlib(path)) { errno = ENOENT; return -1; }
   struct stat real;
   const int ret = stat_L(path, &real);
@@ -472,6 +483,18 @@ int stat_fake(const char *path, struct bionic_stat *st) {
 }
 
 int fstat_fake(int fd, struct bionic_stat *st) {
+  if (nxf_is_fake(fd)) {
+    uint32_t mode; uint64_t ino, rdev;
+    if (!st || nxf_fstat_info(fd, &mode, &ino, &rdev) != 0) { errno = EBADF; return -1; }
+    memset(st, 0, sizeof *st);
+    st->st_dev = 0x0005;
+    st->st_ino = ino;
+    st->st_mode = mode;
+    st->st_nlink = 1;
+    st->st_rdev = rdev;
+    st->st_blksize = 4096;
+    return 0;
+  }
   struct stat real;
   const int ret = fstat(fd, &real);
   if (ret == 0)
@@ -513,7 +536,7 @@ static FakeDir *dir_ok(void *p) {
 
 void *opendir_fake(const char *path) {
   char rbuf[600];
-  path = remap_data_path(path, rbuf, sizeof rbuf);
+  path = shim_game_path(path, rbuf, sizeof rbuf, 0);
   if (path_would_crash_newlib(path)) return NULL;
 
   FILE_LOCK();
@@ -1017,7 +1040,8 @@ void *AAssetManager_fromJava_fake(void *env, void *mgr) {
 /* MUST be an absolute device path. Every path we hand newlib is anchored to
  * this, and a colon-less path makes newlib's FindDevice() fall back to an unset
  * default device -> devoptab_list[dev] == NULL -> Data Abort in _open_r. */
-static char g_asset_base[512] = DATA_DIR;   /* "sdmc:/switch/btd5" */
+static char g_asset_base[512];              /* "" = the game folder (nx_paths.c) */
+static const char *asset_base(void) { return g_asset_base[0] ? g_asset_base : nx_data_dir(); }
 
 void set_asset_base(const char *dir) {
   if (!dir || !*dir) return;
@@ -1051,9 +1075,9 @@ int resolve_asset_path(const char *rel, char *out, size_t out_size) {
   const int nroots = (int)(sizeof(roots) / sizeof(roots[0]));
   for (int i = 0; i < nroots; i++) {
     if (strcmp(roots[i], ".") == 0)
-      snprintf(out, out_size, "%s/%s", g_asset_base, rel);
+      snprintf(out, out_size, "%s/%s", asset_base(), rel);
     else
-      snprintf(out, out_size, "%s/%s/%s", g_asset_base, roots[i], rel);
+      snprintf(out, out_size, "%s/%s/%s", asset_base(), roots[i], rel);
     if (file_exists(out)) return 1;
   }
   return 0;
@@ -1083,16 +1107,136 @@ static const char *remap_data_path(const char *path, char *buf, size_t bufsz) {
    * "newslocal_btd6", "com.ninjakiwi.link/cache.files"). Anchor every one of
    * them under the game directory so the path always carries "sdmc:". */
   if (path[0] == '/')
-    snprintf(buf, bufsz, "%s%s", g_asset_base, path);        /* "/foo" -> base + "/foo" */
+    snprintf(buf, bufsz, "%s%s", asset_base(), path);        /* "/foo" -> base + "/foo" */
   else
-    snprintf(buf, bufsz, "%s/%s", g_asset_base, path);       /* "foo"  -> base + "/foo" */
+    snprintf(buf, bufsz, "%s/%s", asset_base(), path);       /* "foo"  -> base + "/foo" */
   return buf;
+}
+
+/* ---------------------------------------------------------------------------
+ * The one gate every engine path goes through.
+ *
+ * Files written by the game must stay in the game folder (nx_paths.h): the
+ * folder the .nro runs from, found at runtime. Steps:
+ *   1. remap_data_path(): anchor device-less paths ("/x", "x") in the folder;
+ *      pseudo-paths (/proc, /dev, /sys) pass through untouched.
+ *   2. normalise "." / ".." / "//", so "<folder>/../x" cannot climb out.
+ *   3. inside the folder -> use it.
+ *   4. outside -> a WRITE is redirected to <folder>/outside/<device>/<path>;
+ *      a READ uses that copy if the game wrote one, else the original. So a
+ *      stray write never lands elsewhere on the SD card, and the game can
+ *      still read back what it wrote.
+ * Returns NULL (errno ENAMETOOLONG) if a path does not fit.
+ * ------------------------------------------------------------------------- */
+static int mode_writes(const char *m) { return m && (strchr(m, 'w') || strchr(m, 'a') || strchr(m, '+')); }
+static int open_writes(int f) { return (f & 3) || (f & (LINUX_O_CREAT | LINUX_O_TRUNC | LINUX_O_APPEND)); }
+
+static void ensure_parents_in_folder(const char *path) {
+  /* mkdir -p for the part of `path` below the game folder (every such dir has
+   * at least two components, so newlib's device-root crash cannot apply). */
+  char tmp[600];
+  snprintf(tmp, sizeof tmp, "%s", path);
+  const size_t base = strlen(nx_data_dir());
+  for (size_t i = base + 1; tmp[i]; i++) {
+    if (tmp[i] != '/') continue;
+    tmp[i] = 0;
+    FILE_LOCK(); mkdir(tmp, 0777); FILE_UNLOCK();
+    tmp[i] = '/';
+  }
+}
+
+const char *shim_game_path(const char *path, char *buf, size_t n, int write) {
+  if (!path || !buf || n < 2) return path;
+  char a[600];
+  const char *p = remap_data_path(path, a, sizeof a);
+  if (!p || !strchr(p, ':')) return p;                     /* pseudo-path: untouched */
+
+  char norm[600];
+  if (nx_path_normalize(p, norm, sizeof norm) != 0) { errno = 36; return NULL; }   /* ENAMETOOLONG */
+  if (nx_path_inside_data(norm)) {
+    if (snprintf(buf, n, "%s", norm) >= (int)n) { errno = 36; return NULL; }
+    return buf;
+  }
+
+  const char *colon = strchr(norm, ':');
+  char ov[600];
+  const int len = snprintf(ov, sizeof ov, "%s/outside/%.*s%s", nx_data_dir(),
+                           (int)(colon - norm), norm, colon + 1);
+  if (len < 0 || (size_t)len >= sizeof ov || (size_t)len >= n) { errno = 36; return NULL; }
+  if (write) {
+    ensure_parents_in_folder(ov);
+    static volatile int told;
+    if (told < 16) {
+      told++;
+      debugPrintf("[files] write outside the game folder redirected: %s -> %s\n", norm, ov);
+      nx_net_logf("[files] write outside the game folder redirected: %s -> %s\n", norm, ov);
+    }
+    memcpy(buf, ov, (size_t)len + 1);
+    return buf;
+  }
+  struct stat st;
+  if (!path_would_crash_newlib(ov) && stat_L(ov, &st) == 0) { memcpy(buf, ov, (size_t)len + 1); return buf; }
+  if (snprintf(buf, n, "%s", norm) >= (int)n) { errno = 36; return NULL; }
+  return buf;
+}
+
+/* Temp files live in <folder>/tmp. FAT cannot delete a file that is still
+ * open, so they are cleared at the next start instead (shim_tmp_cleanup). */
+static int tmp_dir(char *out, size_t n) {
+  if (!nx_data_file("tmp", out, n)) return 0;
+  FILE_LOCK(); mkdir(out, 0777); FILE_UNLOCK();
+  return 1;
+}
+
+void shim_tmp_cleanup(void) {
+  char dir[600], f[800];
+  if (!nx_data_file("tmp", dir, sizeof dir)) return;
+  FILE_LOCK();
+  DIR *d = opendir(dir);
+  if (d) {
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      const size_t l = strlen(e->d_name);
+      if (l > 4 && !strcmp(e->d_name + l - 4, ".tmp")) {
+        snprintf(f, sizeof f, "%s/%s", dir, e->d_name);
+        remove(f);
+      }
+    }
+    closedir(d);
+  }
+  FILE_UNLOCK();
+}
+
+FILE *tmpfile_fake(void) {
+  char dir[600], path[700];
+  if (!tmp_dir(dir, sizeof dir)) return NULL;
+  static volatile unsigned seq;
+  const unsigned r = __atomic_add_fetch(&seq, 1, __ATOMIC_RELAXED) * 2654435761u ^ (unsigned)armGetSystemTick();
+  snprintf(path, sizeof path, "%s/f%08x.tmp", dir, r);
+  FILE_LOCK(); FILE *f = fopen(path, "w+b"); FILE_UNLOCK();
+  return f;
+}
+
+int mkstemp_fake(char *tmpl) {
+  if (!tmpl) { errno = 22; return -1; }                      /* EINVAL */
+  char buf[600], work[600];
+  const char *p = shim_game_path(tmpl, buf, sizeof buf, 1);
+  if (!p || path_would_crash_newlib(p)) return -1;
+  snprintf(work, sizeof work, "%s", p);
+  FILE_LOCK(); const int fd = mkstemp(work); FILE_UNLOCK();
+  if (fd >= 0) {
+    /* newlib filled in the trailing XXXXXX of OUR copy; the caller must see the
+     * same name, so copy those six characters back into its template. */
+    const size_t tl = strlen(tmpl), wl = strlen(work);
+    if (tl >= 6 && wl >= 6) memcpy(tmpl + tl - 6, work + wl - 6, 6);
+  }
+  return fd;
 }
 
 int rename_fake(const char *oldp, const char *newp) {
   char a[600], b[600];
-  const char *rold = remap_data_path(oldp, a, sizeof a);
-  const char *rnew = remap_data_path(newp, b, sizeof b);
+  const char *rold = shim_game_path(oldp, a, sizeof a, 1);
+  const char *rnew = shim_game_path(newp, b, sizeof b, 1);
   if (path_would_crash_newlib(rold) || path_would_crash_newlib(rnew)) return -1;
   FILE_LOCK();                       /* device-layer op: same lock as open/close */
   int rc = rename(rold, rnew);
@@ -1110,19 +1254,19 @@ int rename_fake(const char *oldp, const char *newp) {
 }
 int remove_fake(const char *path) {
   char a[600];
-  const char *p = remap_data_path(path, a, sizeof a);
+  const char *p = shim_game_path(path, a, sizeof a, 1);
   if (path_would_crash_newlib(p)) return -1;
   return remove_L(p);
 }
 int unlink_fake(const char *path) {
   char a[600];
-  const char *p = remap_data_path(path, a, sizeof a);
+  const char *p = shim_game_path(path, a, sizeof a, 1);
   if (path_would_crash_newlib(p)) return -1;
   return unlink_L(p);
 }
 int access_fake(const char *path, int mode) {
   char a[600];
-  const char *p = remap_data_path(path, a, sizeof a);
+  const char *p = shim_game_path(path, a, sizeof a, 0);
   if (path_would_crash_newlib(p)) return -1;
   return access_L(p, mode);
 }
@@ -1173,9 +1317,9 @@ FILE *fopen_fake(const char *path, const char *mode) {
     if (m) return m;
   }
 
-  // redirect root-relative save/data files into the game directory
+  // every engine path goes through the game-folder gate (shim_game_path)
   char rbuf[600];
-  path = remap_data_path(path, rbuf, sizeof rbuf);
+  path = shim_game_path(path, rbuf, sizeof rbuf, mode_writes(mode));
 
   // reject paths that would null-deref newlib's devoptab (see helper above)
   if (path_would_crash_newlib(path)) {

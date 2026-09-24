@@ -17,6 +17,9 @@
 
 #include "config.h"
 #include "platform.h"
+#include "nx_pointer.h"
+#include "nx_paths.h"
+#include "libc_shim.h"   /* fopen_fake/fclose_fake: locked newlib file I/O */
 #include "util.h"
 
 /* ===================== SO load zone ======================================= *
@@ -53,165 +56,55 @@ void egl_init_context(void) {
 void egl_swap_buffers(void) { /* engine swaps inside nativeTick */ }
 void egl_exit_context(void) { /* engine tears down its own EGL */ }
 
-/* ===================== Input ============================================== */
-static PadState s_pad;
-static int      s_pad_ready = 0;
+/* ===================== Input =============================================
+ * All pointer input (touchscreen, USB mouse, stick cursor) and the on-screen
+ * cursor overlay now live in the reusable nx_pointer module, so the same
+ * control scheme can be dropped straight into other Switch/Android ports.
+ * platform.c just adapts it to this port's existing API.
+ * ======================================================================== */
 
-/* handheld multitouch tracking (by slot index) */
-static int   s_prev_active[10];
-static float s_prev_x[10], s_prev_y[10];
+static void nxp_logger(const char *msg) { debugPrintf("%s", (char *)msg); }
 
-/* Virtual cursor -- available in BOTH handheld and docked.
- *   '+'  shows it
- *   '-'  hides it
- *   'A'  taps at the cursor
- * In handheld the touchscreen stays live at the same time, so you can use
- * either (or both). Docked has no touchscreen, so the cursor starts visible
- * there; in handheld it starts hidden since touch is the natural input. */
-static float s_cur_x, s_cur_y;
-static int   s_cur_down_prev;
-static int   s_cursor_visible = -1;   /* -1 = not yet initialised */
-static int   s_was_docked = -1;
-
-/* Pointer ids: keep the cursor out of the touchscreen's id range so the two
- * never collide when both are active in handheld. */
-#define CURSOR_PTR_ID   8
-#define MAX_TOUCH_SLOTS 8
-
-static void ensure_pad(void) {
-  if (s_pad_ready) return;
-  padConfigureInput(1, HidNpadStyleSet_NpadStandard);
-  padInitializeDefault(&s_pad);
-  hidInitializeTouchScreen();
-  s_cur_x = screen_width  * 0.5f;
-  s_cur_y = screen_height * 0.5f;
-  s_pad_ready = 1;
-}
-
-static int is_docked(void) {
-  return appletGetOperationMode() == AppletOperationMode_Console;
-}
-
-/* Collected once per frame by padUpdate_all(), drained by platform_poll_pointers. */
-static PtrEvent s_events[16];
-static int      s_nevents;
-
-/* The Switch touch panel always reports in its native 1280x720 space, no matter
- * what resolution we render at. The engine works in render space (1920x1080), so
- * raw panel coordinates only ever reach the top-left 2/3 of the screen -- the
- * right edge and bottom edge (and hence the corners) are physically untouchable.
- * Scale panel -> render space. */
-#define NX_TOUCH_PANEL_W 1280.0f
-#define NX_TOUCH_PANEL_H 720.0f
-
-/* Appends to s_events (does NOT reset it) so touch and cursor can coexist. */
-static void collect_touch_events(void) {
-  HidTouchScreenState ts = {0};
-  hidGetTouchScreenStates(&ts, 1);
-  int now[10] = {0};
-  int count = ts.count > MAX_TOUCH_SLOTS ? MAX_TOUCH_SLOTS : ts.count;
-
-  const float sx = (float)screen_width  / NX_TOUCH_PANEL_W;   /* 1920/1280 = 1.5 */
-  const float sy = (float)screen_height / NX_TOUCH_PANEL_H;   /* 1080/720  = 1.5 */
-
-  for (int i = 0; i < count; i++) {
-    float x = (float)ts.touches[i].x * sx;
-    float y = (float)ts.touches[i].y * sy;
-    /* clamp so an edge touch maps exactly onto the last pixel */
-    if (x < 0) x = 0; if (x > screen_width  - 1) x = (float)(screen_width  - 1);
-    if (y < 0) y = 0; if (y > screen_height - 1) y = (float)(screen_height - 1);
-    now[i] = 1;
-    if (s_nevents < 16) {
-      PtrEvent *e = &s_events[s_nevents++];
-      e->id = i; e->x = x; e->y = y;
-      e->phase = s_prev_active[i] ? PTR_MOVE : PTR_DOWN;
-    }
-    s_prev_x[i] = x; s_prev_y[i] = y;
-  }
-  for (int i = 0; i < MAX_TOUCH_SLOTS; i++) {
-    if (s_prev_active[i] && !now[i] && s_nevents < 16) {
-      PtrEvent *e = &s_events[s_nevents++];
-      e->id = i; e->x = s_prev_x[i]; e->y = s_prev_y[i]; e->phase = PTR_UP;
-    }
-    s_prev_active[i] = now[i];
-  }
-}
-
-/* Appends to s_events. Left stick moves the cursor, A is the tap. */
-static void collect_cursor_events(void) {
-  HidAnalogStickState ls = padGetStickPos(&s_pad, 0);
-  const float SPEED = 14.0f;           /* px per frame at full deflection */
-  s_cur_x += (ls.x / 32767.0f) * SPEED;
-  s_cur_y -= (ls.y / 32767.0f) * SPEED;
-  /* clamp to the last valid pixel, not one past it (screen_width would be an
-   * off-screen column and the engine's hit-testing would miss the edge) */
-  if (s_cur_x < 0) s_cur_x = 0;
-  if (s_cur_x > screen_width  - 1) s_cur_x = (float)(screen_width  - 1);
-  if (s_cur_y < 0) s_cur_y = 0;
-  if (s_cur_y > screen_height - 1) s_cur_y = (float)(screen_height - 1);
-
-  int down = (padGetButtons(&s_pad) & HidNpadButton_A) ? 1 : 0;
-  int phase = 0;
-  if (down && !s_cur_down_prev)      phase = PTR_DOWN;
-  else if (down && s_cur_down_prev)  phase = PTR_MOVE;
-  else if (!down && s_cur_down_prev) phase = PTR_UP;
-  s_cur_down_prev = down;
-  if (phase && s_nevents < 16) {
-    PtrEvent *e = &s_events[s_nevents++];
-    e->id = CURSOR_PTR_ID; e->x = s_cur_x; e->y = s_cur_y; e->phase = phase;
-  }
+static void ensure_pointer(void) {
+  static int done = 0;
+  if (done) return;
+  done = 1;
+  NxpConfig cfg = {0};
+  cfg.screen_w  = screen_width;
+  cfg.screen_h  = screen_height;
+  cfg.panel_w   = 1280;            /* Switch touch panel is always 1280x720 */
+  cfg.panel_h   = 720;
+  cfg.data_dir  = nx_data_dir();   /* cursor.png + pointer.cfg: the game folder */
+  cfg.cursor_id = 8;               /* keep clear of touch ids 0..7 */
+  cfg.max_touch_slots = 8;
+  cfg.log       = nxp_logger;
+  /* Give the module our LOCKED file wrappers. It saves pointer.cfg at runtime,
+   * while the engine's worker threads are doing their own file I/O -- an
+   * unlocked open/close from here would race devkitPro's (non-thread-safe)
+   * handle table and corrupt it. */
+  cfg.fopen_fn  = fopen_fake;
+  cfg.fclose_fn = fclose_fake;
+  nxp_init(&cfg);
 }
 
 void padUpdate_all(void) {
-  ensure_pad();
-  padUpdate(&s_pad);
-
-  const int docked = is_docked();
-
-  /* First run, and whenever we dock/undock: docked has no touchscreen, so make
-   * sure the cursor is up there; handheld defaults to touch. */
-  if (docked != s_was_docked) {
-    if (s_cursor_visible < 0 || docked)
-      s_cursor_visible = docked ? 1 : 0;
-    s_was_docked = docked;
-  }
-
-  /* '+' shows the cursor, '-' hides it -- in both modes. */
-  const u64 pressed = padGetButtonsDown(&s_pad);
-  if (pressed & HidNpadButton_Plus)  s_cursor_visible = 1;
-  if (pressed & HidNpadButton_Minus) s_cursor_visible = 0;
-
-  s_nevents = 0;
-  if (!docked)          collect_touch_events();   /* touchscreen: handheld only */
-  if (s_cursor_visible) collect_cursor_events();  /* cursor: either mode */
+  ensure_pointer();
+  nxp_update();
 }
 
-/* Queried by the renderer (eglSwapBuffers_fake) to draw the cursor. */
-int  cursor_is_visible(void) { return s_cursor_visible > 0; }
-void cursor_get_pos(float *x, float *y) { if (x) *x = s_cur_x; if (y) *y = s_cur_y; }
+/* Draw the cursor on top of the engine's finished frame (called from
+ * eglSwapBuffers_fake, which runs with the GL context current). */
+void cursor_draw(void) { nxp_draw(); }
 
 int platform_poll_pointers(PtrEvent *out, int max) {
-  int n = s_nevents < max ? s_nevents : max;
-  memcpy(out, s_events, n * sizeof(PtrEvent));
-  return n;
+  /* NxpEvent and PtrEvent are the same {int id; float x,y; int phase;} layout. */
+  return nxp_poll((NxpEvent *)out, max);
 }
 
-/* B is the Android BACK key. Plus used to be wired here too, but it now shows
- * the cursor -- leaving it as BACK would fire a back-press every time you
- * brought the cursor up. */
-int back_edge_pressed(void) {
-  return (padGetButtonsDown(&s_pad) & HidNpadButton_B) ? 1 : 0;
-}
-int back_edge_released(void) {
-  return (padGetButtonsUp(&s_pad) & HidNpadButton_B) ? 1 : 0;
-}
 
-int should_quit(void) {
-  /* HOME suspends/exits via the applet; also allow a deliberate combo. */
-  u64 h = padGetButtons(&s_pad);
-  return (h & HidNpadButton_Minus) && (h & HidNpadButton_StickL) &&
-         (h & HidNpadButton_StickR);
-}
+/* Back key and the quit combo were removed: BTD5 has no use for an Android Back
+ * event, and HOME already exits the port cleanly, so a button combo to quit was
+ * redundant. (ZL/ZR/A all confirm; see nx_pointer.) */
 
 int handle_dock_change(int *w, int *h) {
   /* Fixed 1080p in every mode -- never signal a resolution change, so the
@@ -406,146 +299,4 @@ EGLBoolean eglQuerySurface_fake(EGLDisplay d, EGLSurface s, EGLint attr, EGLint 
     }
   }
   return r;
-}
-
-/* ===================== On-screen cursor ==================================
- * The engine owns the GL context and presents via eglSwapBuffers, so we draw
- * the cursor from inside eglSwapBuffers_fake -- after the engine has rendered
- * its frame, just before it goes to the panel. That means it always sits on top.
- *
- * We use our own tiny shader + client-side vertex array, and save/restore every
- * piece of GL state we touch, so the engine's next frame is unaffected.
- * ======================================================================== */
-
-static GLuint s_cur_prog = 0;
-static GLint  s_loc_pos, s_loc_screen, s_loc_origin, s_loc_scale, s_loc_colour;
-static int    s_cur_gl_failed = 0;
-
-/* A classic arrow, in local units with the tip at (0,0), y down. Drawn as a
- * triangle fan from the tip (the shape is star-shaped about the tip). */
-static const GLfloat s_arrow[] = {
-   0.0f,  0.0f,
-   0.0f, 16.0f,
-   4.0f, 12.0f,
-   7.0f, 18.0f,
-  10.0f, 16.5f,
-   7.0f, 10.5f,
-  12.0f, 10.0f,
-};
-#define ARROW_VERTS (sizeof(s_arrow) / (2 * sizeof(GLfloat)))
-
-static GLuint cursor_compile(GLenum type, const char *src) {
-  GLuint s = glCreateShader(type);
-  glShaderSource(s, 1, &src, NULL);
-  glCompileShader(s);
-  GLint ok = 0;
-  glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-  if (!ok) { glDeleteShader(s); return 0; }
-  return s;
-}
-
-static int cursor_init_gl(void) {
-  if (s_cur_prog) return 1;
-  if (s_cur_gl_failed) return 0;
-
-  static const char *vs =
-    "attribute vec2 aPos;\n"
-    "uniform vec2 uScreen;\n"
-    "uniform vec2 uOrigin;\n"
-    "uniform float uScale;\n"
-    "void main() {\n"
-    "  vec2 p = uOrigin + aPos * uScale;\n"
-    "  vec2 ndc = vec2((p.x / uScreen.x) * 2.0 - 1.0,\n"
-    "                  1.0 - (p.y / uScreen.y) * 2.0);\n"
-    "  gl_Position = vec4(ndc, 0.0, 1.0);\n"
-    "}\n";
-  static const char *fs =
-    "precision mediump float;\n"
-    "uniform vec4 uColour;\n"
-    "void main() { gl_FragColor = uColour; }\n";
-
-  GLuint v = cursor_compile(GL_VERTEX_SHADER, vs);
-  GLuint f = cursor_compile(GL_FRAGMENT_SHADER, fs);
-  if (!v || !f) { s_cur_gl_failed = 1; debugPrintf("cursor: shader compile failed\n"); return 0; }
-
-  GLuint p = glCreateProgram();
-  glAttachShader(p, v);
-  glAttachShader(p, f);
-  glBindAttribLocation(p, 0, "aPos");
-  glLinkProgram(p);
-  glDeleteShader(v);
-  glDeleteShader(f);
-
-  GLint ok = 0;
-  glGetProgramiv(p, GL_LINK_STATUS, &ok);
-  if (!ok) { glDeleteProgram(p); s_cur_gl_failed = 1; debugPrintf("cursor: link failed\n"); return 0; }
-
-  s_cur_prog   = p;
-  s_loc_pos    = 0;
-  s_loc_screen = glGetUniformLocation(p, "uScreen");
-  s_loc_origin = glGetUniformLocation(p, "uOrigin");
-  s_loc_scale  = glGetUniformLocation(p, "uScale");
-  s_loc_colour = glGetUniformLocation(p, "uColour");
-  debugPrintf("cursor: gl ready (prog=%u)\n", p);
-  return 1;
-}
-
-void cursor_draw(void) {
-  if (!cursor_is_visible()) return;
-  if (!cursor_init_gl())    return;
-
-  float cx, cy;
-  cursor_get_pos(&cx, &cy);
-
-  /* --- save every bit of state we are about to change --- */
-  GLint  prev_prog = 0, prev_buf = 0;
-  GLint  bs_rgb = 0, bd_rgb = 0, bs_a = 0, bd_a = 0;
-  GLint  attr0_on = 0;
-  glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
-  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_buf);
-  glGetIntegerv(GL_BLEND_SRC_RGB, &bs_rgb);
-  glGetIntegerv(GL_BLEND_DST_RGB, &bd_rgb);
-  glGetIntegerv(GL_BLEND_SRC_ALPHA, &bs_a);
-  glGetIntegerv(GL_BLEND_DST_ALPHA, &bd_a);
-  glGetVertexAttribiv(0, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &attr0_on);
-  const GLboolean was_blend   = glIsEnabled(GL_BLEND);
-  const GLboolean was_depth   = glIsEnabled(GL_DEPTH_TEST);
-  const GLboolean was_cull    = glIsEnabled(GL_CULL_FACE);
-  const GLboolean was_scissor = glIsEnabled(GL_SCISSOR_TEST);
-
-  /* --- draw --- */
-  glDisable(GL_DEPTH_TEST);
-  glDisable(GL_CULL_FACE);
-  glDisable(GL_SCISSOR_TEST);          /* the engine may have clipped to a sub-rect */
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-  glUseProgram(s_cur_prog);
-  glBindBuffer(GL_ARRAY_BUFFER, 0);    /* client-side array (legal in GLES2) */
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, s_arrow);
-
-  glUniform2f(s_loc_screen, (GLfloat)screen_width, (GLfloat)screen_height);
-  glUniform2f(s_loc_origin, cx, cy);
-
-  const GLfloat scale = 2.4f;          /* ~40px tall on a 1080p screen */
-
-  /* black outline first (same shape, scaled up from the tip), then white fill */
-  glUniform1f(s_loc_scale, scale * 1.22f);
-  glUniform4f(s_loc_colour, 0.0f, 0.0f, 0.0f, 0.85f);
-  glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)ARROW_VERTS);
-
-  glUniform1f(s_loc_scale, scale);
-  glUniform4f(s_loc_colour, 1.0f, 1.0f, 1.0f, 1.0f);
-  glDrawArrays(GL_TRIANGLE_FAN, 0, (GLsizei)ARROW_VERTS);
-
-  /* --- restore --- */
-  if (!attr0_on) glDisableVertexAttribArray(0);
-  glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prev_buf);
-  glUseProgram((GLuint)prev_prog);
-  glBlendFuncSeparate((GLenum)bs_rgb, (GLenum)bd_rgb, (GLenum)bs_a, (GLenum)bd_a);
-  if (!was_blend)  glDisable(GL_BLEND);      else glEnable(GL_BLEND);
-  if (was_depth)   glEnable(GL_DEPTH_TEST);
-  if (was_cull)    glEnable(GL_CULL_FACE);
-  if (was_scissor) glEnable(GL_SCISSOR_TEST);
 }

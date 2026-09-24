@@ -40,5 +40,7 @@ static inline uint64_t umin(uint64_t a, uint64_t b) {
   return (a < b) ? a : b;
 }
 
+const char *nx_system_language(void);   /* Switch system language as a 2-letter code */
+
 #endif
 

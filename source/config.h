@@ -32,16 +32,26 @@
 // The single native module from the APK's lib/arm64-v8a/.
 #define SO_NAME  "libnative.so"
 
-#define DATA_DIR "sdmc:/switch/btd5"
-#define LOG_NAME DATA_DIR "/btd5_nx.log"
+/* Where the port and the game write: the folder the .nro runs from, found at
+ * runtime (nx_paths.c). This is used ONLY if the launch path and the working
+ * directory are both unknown. Write paths come from nx_data_dir() /
+ * nx_data_file() -- there are deliberately no DATA_DIR / LOG_NAME /
+ * CONFIG_NAME macros any more, so a hardcoded path cannot creep back in. */
+#define DATA_DIR_FALLBACK "sdmc:/switch/btd5"
+#define LOG_FILE    "btd5_nx.log"      /* debug log (DEBUG_LOG)            */
+#define CRASH_FILE  "btd5_crash.log"   /* crash handler                    */
+#define CONFIG_FILE "config.txt"
 
 // Address-space split (see __libnx_initheap in main.c). libnative.so is ~12 MB
 // of code+data; reserve a fixed zone for it + relocation scratch and give the
 // rest to newlib's heap (textures, audio, the parsed JSON/jet game state).
 #define SO_ZONE_MB 160
 
-// Logging on during bring-up. Set 0 once stable.
+// Logs, both off for release builds. Set to 1 to get them back:
+//   DEBUG_LOG  btd5_nx.log  -- everything, including the save editor's results
+//   NET_LOG    btd5_net.log -- network bring-up, lookups, failures, keyboard
 #define DEBUG_LOG 0
+#define NET_LOG   0
 
 /* Pin EVERY thread (main + all engine workers + audio) to one CPU core.
  *
@@ -84,19 +94,5 @@
 extern int screen_width;
 extern int screen_height;
 
-#define CONFIG_NAME DATA_DIR "/config.txt"
-
-typedef struct {
-  int screen_width;    // 0 = automatic (per dock state)
-  int screen_height;   // 0 = automatic
-  int docked_width;    // default 1920
-  int docked_height;   // default 1080
-  char language[8];    // "auto" or 2-letter code
-} Config;
-
-extern Config config;
-
-int read_config(const char *file);
-int write_config(const char *file);
 
 #endif

@@ -51,6 +51,8 @@ int   setpriority_fake(int which, int who, int prio);
 char *getcwd_fake(char *buf, size_t size);
 int   chdir_fake(const char *path);
 int   mkdir_fake(const char *path, unsigned int mode);
+int   rmdir_fake(const char *path);
+int   chmod_fake(const char *path, unsigned int mode);
 int   readlink_fake(const char *path, char *buf, size_t bufsiz);
 int   utime_fake(const char *path, const void *times);
 char *strcasestr_fake(const char *haystack, const char *needle);

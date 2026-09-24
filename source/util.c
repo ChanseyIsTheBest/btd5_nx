@@ -16,25 +16,29 @@
 
 #include "util.h"
 #include "config.h"
+#include "nx_net.h"
+#include "nx_paths.h"
 
 #if DEBUG_LOG
 
 static int s_nxlinkSock = -1;
 
+/* The socket service is brought up ONCE, by nx_net_init() with the engine's
+ * session count; nxlink rides on it. (A socketInitializeDefault() here would
+ * pin the default 3 sessions for the whole run.) nx_net_init is idempotent,
+ * so main()'s later call is a no-op. */
 static void initNxLink(void) {
-  if (R_FAILED(socketInitializeDefault()))
-    return;
+  nx_paths_init();          /* the game folder, before anything writes */
+  nx_net_init();
   s_nxlinkSock = nxlinkStdio();
-  if (s_nxlinkSock < 0)
-    socketExit();
 }
 
 static void deinitNxLink(void) {
   if (s_nxlinkSock >= 0) {
     close(s_nxlinkSock);
-    socketExit();
     s_nxlinkSock = -1;
   }
+  nx_net_exit();
 }
 
 void userAppInit(void) {
@@ -59,32 +63,27 @@ void userAppExit(void) {
  * Everything here is guarded by one libnx mutex; the FsFile handle is opened
  * lazily on first use. */
 static FsFile s_log_file;
-static s64    s_log_off = 0;     /* bytes actually written to the file */
-static s64    s_log_cap = 0;     /* current file size (we over-allocate) */
+static s64    s_log_off = 0;     /* bytes written == the file's size */
 static int    s_log_ready = 0;   /* 0=unopened, 1=open, -1=failed */
 static Mutex  s_log_mutex;
 
 /* Buffer log text in RAM; only touch the SD card when it fills. See
  * log_flush_locked() for why (per-line resize+flush was pegging the CPU). */
 #define LOG_BUF_SIZE (32 * 1024)
-#define LOG_GROW     (256 * 1024)
 static char   s_log_buf[LOG_BUF_SIZE];
 static size_t s_log_used = 0;
 
 static void log_open_locked(void) {
   FsFileSystem *fs = fsdevGetDeviceFileSystem("sdmc");
-  if (!fs) { s_log_ready = -1; return; }
-  /* LOG_NAME is "sdmc:/switch/btd5/btd5_nx.log"; strip the "sdmc:" mount prefix
-   * for the raw fs API (path is relative to the sd filesystem root). */
-  const char *path = LOG_NAME;
-  const char *colon = path;
-  while (*colon && *colon != ':') colon++;
-  if (*colon == ':') path = colon + 1;   /* -> "/switch/btd5/btd5_nx.log" */
+  char path[600];
+  /* The game folder, found at runtime (nx_paths.c), relative to the SD card
+   * for the raw fs API: e.g. "/switch/btd5/btd5_nx.log". */
+  if (!fs || !nx_data_fs_path(LOG_FILE, path, sizeof path)) { s_log_ready = -1; return; }
+  nx_data_dir_ensure();                  /* may run before main() creates it */
   fsFsCreateFile(fs, path, 0, 0);        /* no-op if it already exists */
   if (R_SUCCEEDED(fsFsOpenFile(fs, path, FsOpenMode_Write | FsOpenMode_Append, &s_log_file))) {
     fsFileSetSize(&s_log_file, 0);       /* truncate for a fresh run */
     s_log_off = 0;
-    s_log_cap = 0;
     s_log_ready = 1;
   } else {
     s_log_ready = -1;
@@ -99,26 +98,23 @@ static void log_open_locked(void) {
  * and it was the reason "CPU is at 99%" even at a locked 60fps.
  *
  * Now: append into a RAM buffer and only touch the filesystem when it fills.
- * The file is grown in big chunks (LOG_GROW) instead of per line, and we do NOT
+ * The file is grown exactly per 32 KB flush (never ahead of its content), and we do NOT
  * force a flush per write -- fsFileFlush is called on shutdown / on demand. */
 static void log_flush_locked(void) {
   if (s_log_ready != 1 || s_log_used == 0)
     return;
 
+  /* Grow EXACTLY to what is written (once per 32 KB buffer, so still cheap).
+   * Growing ahead in 256 KB steps left the tail filled with whatever was on
+   * the SD card before -- FAT does not zero new clusters -- and a game closed
+   * from the HOME menu never got to trim it. */
   const s64 need = s_log_off + (s64)s_log_used;
-  if (need > s_log_cap) {                       /* grow in large steps */
-    s64 want = need + LOG_GROW;
-    if (R_SUCCEEDED(fsFileSetSize(&s_log_file, want)))
-      s_log_cap = want;
-    else if (R_SUCCEEDED(fsFileSetSize(&s_log_file, need)))
-      s_log_cap = need;                         /* fall back to exact */
-    else
-      { s_log_used = 0; return; }               /* give up on this chunk */
-  }
-
+  if (R_FAILED(fsFileSetSize(&s_log_file, need))) { s_log_used = 0; return; }
   if (R_SUCCEEDED(fsFileWrite(&s_log_file, s_log_off, s_log_buf,
                               (u64)s_log_used, FsWriteOption_None)))
     s_log_off += s_log_used;
+  else
+    fsFileSetSize(&s_log_file, s_log_off);      /* keep size == content */
   s_log_used = 0;
 }
 #endif
@@ -160,11 +156,8 @@ void debugLogFlush(void) {
 #if DEBUG_LOG
   mutexLock(&s_log_mutex);
   log_flush_locked();
-  if (s_log_ready == 1) {
-    fsFileSetSize(&s_log_file, s_log_off);   /* trim the over-allocated tail */
-    s_log_cap = s_log_off;
+  if (s_log_ready == 1)
     fsFileFlush(&s_log_file);
-  }
   mutexUnlock(&s_log_mutex);
 #endif
 }
@@ -238,3 +231,48 @@ void cpu_boost(int on) {
 int ret0(void) { return 0; }
 
 int retm1(void) { return -1; }
+
+/* ---------------------------------------------------------------------------
+ * System language -> 2-letter code for the engine's getLanguageCode().
+ *
+ * The engine asks the host for a device language to pick its initial locale (the
+ * in-game language menu overrides it afterwards). Flow:
+ *   setGetSystemLanguage() -> u64 code
+ *   setMakeLanguage(code)  -> SetLanguage enum
+ *   map the enum to an ISO-639-1 code.
+ * Enum members below are the verified libnx SetLanguage set. Cached.
+ * ------------------------------------------------------------------------- */
+const char *nx_system_language(void) {
+  static char code[4] = "";
+  if (code[0]) return code;                  /* cached */
+
+  strcpy(code, "en");                         /* safe default if anything fails */
+
+  if (R_FAILED(setInitialize()))
+    return code;
+
+  u64 lang_code = 0;
+  SetLanguage lang = SetLanguage_ENUS;
+  if (R_SUCCEEDED(setGetSystemLanguage(&lang_code)) &&
+      R_SUCCEEDED(setMakeLanguage(lang_code, &lang))) {
+    switch (lang) {
+      case SetLanguage_JA:                          strcpy(code, "ja"); break;
+      case SetLanguage_FR:   case SetLanguage_FRCA: strcpy(code, "fr"); break;
+      case SetLanguage_DE:                          strcpy(code, "de"); break;
+      case SetLanguage_IT:                          strcpy(code, "it"); break;
+      case SetLanguage_ES:   case SetLanguage_ES419:strcpy(code, "es"); break;
+      case SetLanguage_ZHCN: case SetLanguage_ZHHANS:
+      case SetLanguage_ZHTW: case SetLanguage_ZHHANT:strcpy(code, "zh"); break;
+      case SetLanguage_KO:                          strcpy(code, "ko"); break;
+      case SetLanguage_NL:                          strcpy(code, "nl"); break;
+      case SetLanguage_PT:   case SetLanguage_PTBR: strcpy(code, "pt"); break;
+      case SetLanguage_RU:                          strcpy(code, "ru"); break;
+      case SetLanguage_ENGB: case SetLanguage_ENUS:
+      default:                                      strcpy(code, "en"); break;
+    }
+  }
+  setExit();
+
+  debugPrintf("lang: system language -> \"%s\"\n", code);
+  return code;
+}

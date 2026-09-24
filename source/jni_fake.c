@@ -314,11 +314,19 @@ static jint jf_RegisterNatives(JNIEnv e, jclass c, const JNINativeMethod *m, jin
   FakeObj *cl = c;
   debugPrintf("JNI RegisterNatives(%s, %d methods)\n",
               (cl && cl->tag == T_CLASS) ? cl->cls : "?", n);
-  for (jint i = 0; i < n && s_regnat_n < 128; i++) {
+  for (jint i = 0; i < n; i++) {
     if (!m[i].name || !m[i].fnPtr) continue;
-    s_regnat[s_regnat_n].name = strdup(m[i].name);
-    s_regnat[s_regnat_n].fn   = m[i].fnPtr;
-    s_regnat_n++;
+    /* Re-registration (CDroidKeyboard binds its natives each time a keyboard
+     * object is created) updates the entry instead of appending a duplicate,
+     * so repeated screen visits cannot fill the table. */
+    int k = 0;
+    while (k < s_regnat_n && strcmp(s_regnat[k].name, m[i].name)) k++;
+    if (k == s_regnat_n) {
+      if (s_regnat_n >= 128) continue;
+      s_regnat[k].name = strdup(m[i].name);
+      s_regnat_n++;
+    }
+    s_regnat[k].fn = m[i].fnPtr;
     debugPrintf("  bind %-32s %-10s -> %p\n", m[i].name,
                 m[i].signature ? m[i].signature : "", m[i].fnPtr);
   }

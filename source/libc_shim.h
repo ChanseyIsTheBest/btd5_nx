@@ -108,6 +108,13 @@ int fgetc_fake(FILE *f);
 char *fgets_fake(char *s, int n, FILE *f);
 int fscanf_fake(FILE *f, const char *fmt, ...);
 
+// The game-folder gate (see libc_shim.c): map, normalise and confine an engine
+// path. write=1 for anything that creates, modifies or deletes. NULL if too long.
+const char *shim_game_path(const char *path, char *buf, size_t n, int write);
+void shim_tmp_cleanup(void);      // clear <folder>/tmp left by a previous run
+void shim_fdtable_lock(void);     // newlib handle-table lock (open/close/mkdir...)
+void shim_fdtable_unlock(void);
+
 // buffered fopen for game archives
 FILE *fopen_fake(const char *path, const char *mode);
 

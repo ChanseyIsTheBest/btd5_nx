@@ -33,6 +33,7 @@
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
+#include "nx_net.h"
 #include "os_shims.h"
 
 // Bionic/Linux mmap constants (independent of the host newlib values)
@@ -175,7 +176,7 @@ ssize_t writev_fake(int fd, const struct iovec *iov, int iovcnt) {
   ssize_t total = 0;
   for (int i = 0; i < iovcnt; i++) {
     if (iov[i].iov_len == 0) continue;
-    ssize_t n = write(fd, iov[i].iov_base, iov[i].iov_len);
+    ssize_t n = nxs_write(fd, iov[i].iov_base, iov[i].iov_len);   /* sockets, pipes, files */
     if (n < 0) return total > 0 ? total : -1;
     total += n;
     if ((size_t)n < iov[i].iov_len) break; // short write: stop, report progress
@@ -193,6 +194,14 @@ int   system_fake(const char *command) { (void)command; return -1; }
 int fcntl_fake(int fd, int cmd, ...) {
   va_list ap; va_start(ap, cmd);
   int ret = 0;
+  {
+    /* Sockets and emulated fds keep real O_NONBLOCK state: curl and OpenSSL
+     * drive non-blocking sockets through F_GETFL/F_SETFL (nx_socket.c). */
+    va_list cp; va_copy(cp, ap);
+    const long arg = va_arg(cp, long);
+    va_end(cp);
+    if (nxs_fcntl(fd, cmd, arg, &ret)) { va_end(ap); return ret; }
+  }
   switch (cmd) {
     case F_DUPFD: ret = dup(fd); break;
     case F_GETFL: ret = O_RDWR; break;
@@ -220,6 +229,9 @@ char *getcwd_fake(char *buf, size_t size) {
 int chdir_fake(const char *path) { (void)path; return 0; }
 
 int mkdir_fake(const char *path, unsigned int mode) {
+  char buf[600];
+  path = shim_game_path(path, buf, sizeof buf, 1);    /* confined to the game folder */
+  if (!path) return -1;
   /* newlib's mkdir() null-derefs the devoptab (Data Abort at devoptab->mkdir_r,
    * +0x68) when given a bare device root or a single top-level component
    * ("sdmc:", "sdmc:/switch"). Such dirs always pre-exist; treat as success. */
@@ -231,13 +243,34 @@ int mkdir_fake(const char *path, unsigned int mode) {
       if (!*in || !strchr(in, '/')) return 0;   // device root / top-level: skip
     }
   }
-  if (mkdir(path, mode) == 0) return 0;
+  shim_fdtable_lock();
+  const int mr = mkdir(path, mode);
+  shim_fdtable_unlock();
+  if (mr == 0) return 0;
   if (errno == EEXIST) return 0; // "already exists" is success for save-dir creation
   return -1;
 }
 
 int readlink_fake(const char *path, char *buf, size_t bufsiz) {
   (void)path; (void)buf; (void)bufsiz; errno = EINVAL; return -1;
+}
+
+/* rmdir / chmod used to go straight to newlib: unanchored, unconfined and
+ * outside the fd-table lock. Now they pass the same game-folder gate. */
+int rmdir_fake(const char *path) {
+  char buf[600];
+  const char *p = shim_game_path(path, buf, sizeof buf, 1);
+  if (!p || !strchr(p, ':')) { errno = ENOENT; return -1; }
+  shim_fdtable_lock(); const int r = rmdir(p); shim_fdtable_unlock();
+  return r;
+}
+
+int chmod_fake(const char *path, unsigned int mode) {
+  char buf[600];
+  const char *p = shim_game_path(path, buf, sizeof buf, 1);
+  if (!p || !strchr(p, ':')) { errno = ENOENT; return -1; }
+  shim_fdtable_lock(); const int r = chmod(p, (mode_t)mode); shim_fdtable_unlock();
+  return r;
 }
 
 int utime_fake(const char *path, const void *times) {
